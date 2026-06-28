@@ -18,6 +18,7 @@
 #import <mach-o/arch.h>
 // #import <ellekit/ellekit.h> // Removed for rootful - using Substrate
 #import "IOSVersionInfo.h"
+#import "PXConfigProviderC.h"
 
 #import "PXScope.h"
 
@@ -67,8 +68,7 @@ static void logMemoryHook(NSString *apiName);
 static NSString *getCurrentBundleID(void);
 static NSDictionary *loadScopedApps(void);
 static BOOL isInScopedAppsList(void);
-static BOOL isSpoofingEnabled(void);
-static NSString *getSpoofedDeviceModel(void);
+
 static NSDictionary *getDeviceSpecs(void);
 static float getFreeMemoryPercentage(void);
 static void getConsistentMemoryStats(unsigned long long totalMemory, 
@@ -191,133 +191,9 @@ static BOOL isInScopedAppsList(void) {
 }
 
 // Check if device model spoofing is enabled for the current app with caching
-static BOOL isSpoofingEnabled(void) {
-    NSString *currentBundleID = getCurrentBundleID();
-    if (!currentBundleID) return NO;
-    
-    // Initialize cache if needed
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        cachedBundleDecisions = [NSMutableDictionary dictionary];
-    });
-    
-    // Check cache first
-    @synchronized(cachedBundleDecisions) {
-        NSNumber *cachedDecision = cachedBundleDecisions[currentBundleID];
-        NSDate *decisionTimestamp = cachedBundleDecisions[[currentBundleID stringByAppendingString:@"_timestamp"]];
-        
-        if (cachedDecision && decisionTimestamp && 
-            [[NSDate date] timeIntervalSinceDate:decisionTimestamp] < kCacheValidityDuration) {
-            return [cachedDecision boolValue];
-        }
-    }
-    
-    // Exclude system processes, except Safari/Auth stack when enabled.
-    NSString *proc = [NSProcessInfo processInfo].processName;
-    if ([currentBundleID hasPrefix:@"com.apple."] &&
-        !(PXSafariStackSpoofEnabled() && PXIsSafariStackProcess(currentBundleID, proc))) {
-        @synchronized(cachedBundleDecisions) {
-            cachedBundleDecisions[currentBundleID] = @NO;
-            cachedBundleDecisions[[currentBundleID stringByAppendingString:@"_timestamp"]] = [NSDate date];
-        }
-        return NO;
-    }
-    
-    // Check if the current app is a scoped app AND if device model spoofing is enabled
-    BOOL shouldSpoof = NO;
-    @try {
-        // First check if this app is in the scoped apps list (or is Safari/Auth stack and enabled)
-        BOOL isScoped = isInScopedAppsList() || PXAllowUnscopedSafariStack();
-        if (!isScoped) {
-            shouldSpoof = NO;
-        } else {
-            // Now check if device model spoofing is specifically enabled
-            BOOL managerCheckPassed = NO;
-            if (NSClassFromString(@"IdentifierManager")) {
-                IdentifierManager *manager = [NSClassFromString(@"IdentifierManager") sharedManager];
-                if (manager && [manager isIdentifierEnabled:@"DeviceModel"]) {
-                    shouldSpoof = YES;
-                    managerCheckPassed = YES;
-                }
-            }
-            
-            // If manager check failed (or class missing), try profile settings directly
-            if (!managerCheckPassed) {
-                // Try to get profile settings directly from file
-                NSString *profilesPath = @"/var/mobile/Library/WeaponX/Profiles";
-                NSString *centralInfoPath = [profilesPath stringByAppendingPathComponent:@"current_profile_info.plist"];
-                NSDictionary *centralInfo = [NSDictionary dictionaryWithContentsOfFile:centralInfoPath];
-                
-                NSString *profileId = centralInfo[@"ProfileId"];
-                if (profileId) {
-                    NSString *profileSettingsPath = [profilesPath stringByAppendingPathComponent:[profileId stringByAppendingPathComponent:@"settings.plist"]];
-                    NSDictionary *settings = [NSDictionary dictionaryWithContentsOfFile:profileSettingsPath];
-                    if (settings && settings[@"deviceModelEnabled"]) {
-                        shouldSpoof = [settings[@"deviceModelEnabled"] boolValue];
-                    }
-                }
-            }
-        }
-    } @catch (NSException *exception) {
-        PXLog(@"[DeviceSpec] Exception checking if device model spoofing is enabled: %@", exception);
-        shouldSpoof = NO;
-    }
-    
-    // Cache the decision
-    @synchronized(cachedBundleDecisions) {
-        cachedBundleDecisions[currentBundleID] = @(shouldSpoof);
-        cachedBundleDecisions[[currentBundleID stringByAppendingString:@"_timestamp"]] = [NSDate date];
-    }
-    
-    return shouldSpoof;
-}
+
 
 // Get the device model from profile
-static NSString *getSpoofedDeviceModel() {
-    @try {
-        // Try multiple methods to get the model value
-        NSString *deviceModel = nil;
-
-        // METHOD 0: Prefer IdentifierManager for consistency with other hooks
-        if (NSClassFromString(@"IdentifierManager")) {
-            IdentifierManager *manager = [NSClassFromString(@"IdentifierManager") sharedManager];
-            if (manager) {
-                NSString *m = [manager currentValueForIdentifier:@"DeviceModel"];
-                if (m.length > 0) {
-                    deviceModel = m;
-                }
-            }
-        }
-        
-        // METHOD 1: Try direct access from profile plist (device_ids.plist)
-        if (!deviceModel.length) {
-            NSString *profilesPath = @"/var/mobile/Library/WeaponX/Profiles";
-            NSString *centralInfoPath = [profilesPath stringByAppendingPathComponent:@"current_profile_info.plist"];
-            NSDictionary *centralInfo = [NSDictionary dictionaryWithContentsOfFile:centralInfoPath];
-
-            NSString *profileId = centralInfo[@"ProfileId"];
-            if (profileId) {
-                // Build path to identity directory
-                NSString *identityDir = [[profilesPath stringByAppendingPathComponent:profileId] stringByAppendingPathComponent:@"identity"];
-
-                NSString *deviceIdsPath = [identityDir stringByAppendingPathComponent:@"device_ids.plist"];
-                NSDictionary *deviceIds = [NSDictionary dictionaryWithContentsOfFile:deviceIdsPath];
-                deviceModel = deviceIds[@"DeviceModel"];
-            }
-        }
-        
-        // METHOD 2: Use DeviceModelManager as fallback (do not generate here)
-        if (!deviceModel.length && NSClassFromString(@"DeviceModelManager")) {
-            DeviceModelManager *deviceManager = [NSClassFromString(@"DeviceModelManager") sharedManager];
-            deviceModel = [deviceManager currentDeviceModel];
-        }
-        
-        return deviceModel;
-    } @catch (NSException *exception) {
-        PXLog(@"[DeviceSpec] Exception getting spoofed device model: %@", exception);
-        return nil;
-    }
-}
 
 // Get all device specifications for the current spoofed model
 static NSDictionary *getDeviceSpecs() {
@@ -397,7 +273,7 @@ static NSDictionary *getDeviceSpecs() {
         
         // METHOD 2: Fallback to DeviceModelManager
         // Get the current spoofed device model
-        NSString *deviceModel = getSpoofedDeviceModel();
+        NSString *deviceModel = PXGetSpoofedDeviceModel();
         if (!deviceModel.length) {
             return nil;
         }
@@ -495,7 +371,7 @@ static BOOL shouldSpoofResolutionForCurrentProcess() {
 - (CGRect)bounds {
     CGRect originalBounds = %orig;
     
-    if (!isSpoofingEnabled() || !PXDisplayUIScaleSpoofEnabled() || !shouldSpoofResolutionForCurrentProcess()) {
+    if (!PXIsDeviceModelSpoofingEnabled() || !PXDisplayUIScaleSpoofEnabled() || !shouldSpoofResolutionForCurrentProcess()) {
         return originalBounds;
     }
     
@@ -555,7 +431,7 @@ static BOOL shouldSpoofResolutionForCurrentProcess() {
 - (CGRect)nativeBounds {
     CGRect originalNativeBounds = %orig;
     
-    if (!isSpoofingEnabled() || !PXDisplayPixelMetricsSpoofEnabled() || !shouldSpoofResolutionForCurrentProcess()) {
+    if (!PXIsDeviceModelSpoofingEnabled() || !PXDisplayPixelMetricsSpoofEnabled() || !shouldSpoofResolutionForCurrentProcess()) {
         return originalNativeBounds;
     }
     
@@ -596,7 +472,7 @@ static BOOL shouldSpoofResolutionForCurrentProcess() {
 - (CGFloat)scale {
     CGFloat originalScale = %orig;
     
-    if (!isSpoofingEnabled() || !shouldSpoofResolutionForCurrentProcess()) {
+    if (!PXIsDeviceModelSpoofingEnabled() || !shouldSpoofResolutionForCurrentProcess()) {
         return originalScale;
     }
     
@@ -625,7 +501,7 @@ static BOOL shouldSpoofResolutionForCurrentProcess() {
 - (UIScreenMode *)currentMode {
     UIScreenMode *originalMode = %orig;
     
-    if (!isSpoofingEnabled()) {
+    if (!PXIsDeviceModelSpoofingEnabled()) {
         return originalMode;
     }
     
@@ -645,7 +521,7 @@ static BOOL shouldSpoofResolutionForCurrentProcess() {
 - (unsigned long long)physicalMemory {
     unsigned long long originalMemory = %orig;
     
-    if (!isSpoofingEnabled()) {
+    if (!PXIsDeviceModelSpoofingEnabled()) {
         return originalMemory;
     }
     
@@ -690,7 +566,7 @@ static BOOL shouldSpoofResolutionForCurrentProcess() {
 - (unsigned long long)availableMemory {
     unsigned long long originalAvailableMemory = %orig;
     
-    if (!isSpoofingEnabled()) {
+    if (!PXIsDeviceModelSpoofingEnabled()) {
         return originalAvailableMemory;
     }
     
@@ -727,7 +603,7 @@ static BOOL shouldSpoofResolutionForCurrentProcess() {
 - (NSUInteger)processorCount {
     NSUInteger originalCount = %orig;
     
-    if (!isSpoofingEnabled()) {
+    if (!PXIsDeviceModelSpoofingEnabled()) {
         return originalCount;
     }
     
@@ -757,7 +633,7 @@ static BOOL shouldSpoofResolutionForCurrentProcess() {
 - (NSString *)machineHardwareName {
     NSString *originalName = %orig;
     
-    if (!isSpoofingEnabled()) {
+    if (!PXIsDeviceModelSpoofingEnabled()) {
         return originalName;
     }
     
@@ -802,7 +678,7 @@ static BOOL shouldSpoofResolutionForCurrentProcess() {
         return;
     }
     
-    if (!isSpoofingEnabled()) {
+    if (!PXIsDeviceModelSpoofingEnabled()) {
         return;
     }
     
@@ -851,7 +727,7 @@ static BOOL shouldSpoofResolutionForCurrentProcess() {
 - (id)getParameter:(unsigned)pname {
     id original = %orig;
     
-    if (!isSpoofingEnabled()) {
+    if (!PXIsDeviceModelSpoofingEnabled()) {
         return original;
     }
     
@@ -917,7 +793,7 @@ static BOOL shouldSpoofResolutionForCurrentProcess() {
 - (NSString *)name {
     NSString *originalName = %orig;
     
-    if (!isSpoofingEnabled()) {
+    if (!PXIsDeviceModelSpoofingEnabled()) {
         return originalName;
     }
     
@@ -945,7 +821,7 @@ static BOOL shouldSpoofResolutionForCurrentProcess() {
 - (NSString *)familyName {
     NSString *originalFamilyName = %orig;
     
-    if (!isSpoofingEnabled()) {
+    if (!PXIsDeviceModelSpoofingEnabled()) {
         return originalFamilyName;
     }
     
@@ -979,7 +855,7 @@ static BOOL shouldSpoofResolutionForCurrentProcess() {
 - (CGFloat)nativeScale {
     CGFloat original = %orig;
 
-    if (!isSpoofingEnabled() || !PXDisplayUIScaleSpoofEnabled() || !shouldSpoofResolutionForCurrentProcess()) {
+    if (!PXIsDeviceModelSpoofingEnabled() || !PXDisplayUIScaleSpoofEnabled() || !shouldSpoofResolutionForCurrentProcess()) {
         return original;
     }
 
@@ -997,7 +873,7 @@ static BOOL shouldSpoofResolutionForCurrentProcess() {
     CGFloat originalScale = %orig;
     
     // Avoid spoofing screen density in Safari/Auth stack; it can desync page layout/touch logic.
-    if (!isSpoofingEnabled() || !PXDisplayUIScaleSpoofEnabled() || !shouldSpoofResolutionForCurrentProcess()) {
+    if (!PXIsDeviceModelSpoofingEnabled() || !PXDisplayUIScaleSpoofEnabled() || !shouldSpoofResolutionForCurrentProcess()) {
         return originalScale;
     }
     
@@ -1062,7 +938,7 @@ static void refreshCaches(CFNotificationCenterRef center, void *observer, CFStri
         return;
     }
     
-    if (!isSpoofingEnabled()) {
+    if (!PXIsDeviceModelSpoofingEnabled()) {
         return;
     }
     
@@ -1106,7 +982,7 @@ static void refreshCaches(CFNotificationCenterRef center, void *observer, CFStri
         return;
     }
     
-    if (!isSpoofingEnabled()) {
+    if (!PXIsDeviceModelSpoofingEnabled()) {
         return;
     }
     
@@ -1140,7 +1016,7 @@ static void refreshCaches(CFNotificationCenterRef center, void *observer, CFStri
 - (unsigned int)max_cpus {
     unsigned int original = %orig;
     
-    if (!isSpoofingEnabled()) {
+    if (!PXIsDeviceModelSpoofingEnabled()) {
         return original;
     }
     
@@ -1285,7 +1161,7 @@ static float getFreeMemoryPercentage(void) {
     float defaultFreePercentage = 0.35; // 35% free
     
     // Check if spoofing is enabled
-    if (!isSpoofingEnabled()) {
+    if (!PXIsDeviceModelSpoofingEnabled()) {
         return defaultFreePercentage;
     }
     
@@ -1360,7 +1236,7 @@ static NXArchInfo* hook_nx_get_local_arch_info() {
     
     NXArchInfo* original = orig_nx_get_local_arch_info();
     
-    if (!isSpoofingEnabled()) {
+    if (!PXIsDeviceModelSpoofingEnabled()) {
         return original;
     }
     
@@ -1438,7 +1314,7 @@ static kern_return_t hook_host_statistics64(host_t host, host_flavor_t flavor, h
     kern_return_t result = orig_host_statistics64(host, flavor, info, count);
     
     // Check if we should modify the result
-    if (result != KERN_SUCCESS || !info || !isSpoofingEnabled()) {
+    if (result != KERN_SUCCESS || !info || !PXIsDeviceModelSpoofingEnabled()) {
         return result;
     }
     
@@ -1599,7 +1475,7 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
     }
 
     // Return original result if conditions not met for the remaining spec/memory spoofing
-    if (result != 0 || !name || !oldlenp || !isSpoofingEnabled() || !oldp || *oldlenp == 0) {
+    if (result != 0 || !name || !oldlenp || !PXIsDeviceModelSpoofingEnabled() || !oldp || *oldlenp == 0) {
         return result;
     }
     
@@ -1982,7 +1858,7 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
     }
     else if (strcmp(name, "hw.machine") == 0) {
         // Machine name - should return the device model like "iPhone10,1"
-        NSString *deviceModel = getSpoofedDeviceModel();
+        NSString *deviceModel = PXGetSpoofedDeviceModel();
         if (deviceModel && deviceModel.length > 0) {
             const char *machineStr = [deviceModel UTF8String];
             if (machineStr && *oldlenp > 0) {
@@ -2036,7 +1912,7 @@ static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void
     }
     
     // Log any unhandled successful sysctl queries for debugging
-    if (result == 0 && isSpoofingEnabled()) {
+    if (result == 0 && PXIsDeviceModelSpoofingEnabled()) {
         static NSMutableSet *loggedIgnoredKeys = nil;
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
